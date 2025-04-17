@@ -1,102 +1,83 @@
-Shader "URP/FullscreenOutlineByDepthAndNormalsThickness"
+Shader "URP/FullscreenOutline_DepthNormal"
 {
     Properties
     {
-        _MainTex ("Texture", 2D) = "white" {}
-        _OutlineThickness ("Outline Thickness", Range(1, 10)) = 1
+        _OutlineColor    ("Outline Color", Color)        = (0,0,0,1)
+        _Thickness       ("Outline Thickness(px)", Range(1,6)) = 1
+        _DepthThreshold  ("Depth Δ",  Range(0,0.02))     = 0.002
+        _NormalThreshold ("Normal Δ", Range(0,1))        = 0.15
     }
 
     SubShader
     {
         Tags { "RenderPipeline" = "UniversalRenderPipeline" }
-
         Pass
         {
-            Name "FullscreenPass"
-            Tags { "LightMode" = "UniversalRenderer" }
+            Name "FullscreenPass"  Tags{ "LightMode"="UniversalRenderer" }
 
             HLSLPROGRAM
             #pragma vertex FullscreenVert
             #pragma fragment frag
-
             #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
 
-            TEXTURE2D(_MainTex);
-            SAMPLER(sampler_MainTex);
+            // 핵심 버퍼
+            TEXTURE2D_X(_BlitTexture);         SAMPLER(sampler_BlitTexture);
+            TEXTURE2D(_CameraDepthTexture);    SAMPLER(sampler_CameraDepthTexture);
+            TEXTURE2D(_CameraNormalsTexture);  SAMPLER(sampler_CameraNormalsTexture);
 
-            TEXTURE2D(_CameraDepthTexture);
-            SAMPLER(sampler_CameraDepthTexture);
+            // 머티리얼 프로퍼티
+            float4 _OutlineColor;
+            float  _Thickness;
+            float  _DepthThreshold;
+            float  _NormalThreshold;
 
-            // 카메라 노말 텍스처. URP 설정에서 노말 텍스처 생성 활성화 필요.
-            TEXTURE2D(_CameraNormalsTexture);
-            SAMPLER(sampler_CameraNormalsTexture);
+            struct Varyings { float4 positionCS : SV_POSITION; };
 
-            // 외곽선 두께 조절 프로퍼티 (_OutlineThickness는 1일 때 기본 3×3 샘플링)
-            float _OutlineThickness;
-
-            struct Varyings
-            {
-                float4 positionCS : SV_POSITION;
-            };
-
-            Varyings FullscreenVert(uint vertexID : SV_VertexID)
+            Varyings FullscreenVert (uint id : SV_VertexID)
             {
                 Varyings o;
-                o.positionCS = GetFullScreenTriangleVertexPosition(vertexID);
+                o.positionCS = GetFullScreenTriangleVertexPosition(id);
                 return o;
             }
 
-            float LinearEyeDepth(float rawDepth)
-            {
-                return Linear01Depth(rawDepth, _ZBufferParams);
-            }
+            // depth to linear eye‑space
+            float LinearEye (float raw) { return Linear01Depth(raw, _ZBufferParams); }
 
-            float4 frag(Varyings i) : SV_Target
+            float4 frag (Varyings i) : SV_Target
             {
-                float2 screenUV = i.positionCS.xy / _ScreenParams.xy;
-                float2 texelSize = 1.0 / _ScreenParams.xy;
+                float2 uv    = i.positionCS.xy / _ScreenParams.xy;
+                float2 texel = _Thickness / _ScreenParams.xy;
 
-                // 깊이(edgeDepth) 검출
-                float depth[9];
-                for (int y = -1; y <= 1; y++)
+                // 기준 픽셀 깊이·노멀
+                float  depthCenter   = LinearEye(SAMPLE_TEXTURE2D(_CameraDepthTexture, sampler_CameraDepthTexture, uv).r);
+                float3 normalCenter  = normalize(SAMPLE_TEXTURE2D(_CameraNormalsTexture, sampler_CameraNormalsTexture, uv).rgb * 2 - 1);
+
+                // 최대 변화량 저장 변수 (ASCII 이름!)
+                float  maxDepthDelta   = 0.0;
+                float  maxNormalDelta  = 0.0;
+
+                [unroll] for (int y = -1; y <= 1; ++y)
                 {
-                    for (int x = -1; x <= 1; x++)
+                    [unroll] for (int x = -1; x <= 1; ++x)
                     {
-                        int index = (y + 1) * 3 + (x + 1);
-                        // _OutlineThickness 값을 곱해 샘플링 오프셋을 조절
-                        float2 offset = float2(x, y) * texelSize * _OutlineThickness;
-                        float d = SAMPLE_TEXTURE2D(_CameraDepthTexture, sampler_CameraDepthTexture, screenUV + offset).r;
-                        depth[index] = LinearEyeDepth(d);
+                        if (x == 0 && y == 0) continue;
+                        float2 offset = float2(x, y) * texel;
+
+                        float  d = LinearEye(SAMPLE_TEXTURE2D(_CameraDepthTexture, sampler_CameraDepthTexture, uv + offset).r);
+                        float3 n = normalize(SAMPLE_TEXTURE2D(_CameraNormalsTexture, sampler_CameraNormalsTexture, uv + offset).rgb * 2 - 1);
+
+                        maxDepthDelta  = max(maxDepthDelta,  abs(d - depthCenter));
+                        maxNormalDelta = max(maxNormalDelta, 1 - dot(n, normalCenter)); // 각도 차
                     }
                 }
-                float sobelX = depth[0] + 2.0 * depth[3] + depth[6] - depth[2] - 2.0 * depth[5] - depth[8];
-                float sobelY = depth[0] + 2.0 * depth[1] + depth[2] - depth[6] - 2.0 * depth[7] - depth[8];
-                float edgeDepth = sqrt(sobelX * sobelX + sobelY * sobelY);
 
-                // 노말(edgeNormal) 검출
-                float3 normals[9];
-                for (int y = -1; y <= 1; y++)
-                {
-                    for (int x = -1; x <= 1; x++)
-                    {
-                        int index = (y + 1) * 3 + (x + 1);
-                        float2 offset = float2(x, y) * texelSize * _OutlineThickness;
-                        // 카메라 노말 텍스처는 [0,1] 범위이므로 [-1,1]로 복원
-                        float3 normSample = SAMPLE_TEXTURE2D(_CameraNormalsTexture, sampler_CameraNormalsTexture, screenUV + offset).rgb;
-                        normSample = normSample * 2.0 - 1.0;
-                        normals[index] = normalize(normSample);
-                    }
-                }
-                float3 sobelN_x = normals[0] + 2.0 * normals[3] + normals[6] - normals[2] - 2.0 * normals[5] - normals[8];
-                float3 sobelN_y = normals[0] + 2.0 * normals[1] + normals[2] - normals[6] - 2.0 * normals[7] - normals[8];
-                float edgeNormal = sqrt(dot(sobelN_x, sobelN_x) + dot(sobelN_y, sobelN_y));
+                bool isEdge =
+                    (maxDepthDelta  > _DepthThreshold) ||
+                    (maxNormalDelta > _NormalThreshold);
 
-                // 깊이 또는 노말의 변화가 임계값을 초과하면 테두리 출력
-                if (edgeDepth > 0.005 || edgeNormal > 1)
-                    return float4(0, 0, 0, 1); // 테두리: 검정색
-                else
-                    return float4(1, 1, 1, 1); // 배경: 흰색
+                float4 src = SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_BlitTexture, uv);
+                return isEdge ? _OutlineColor : src;
             }
             ENDHLSL
         }
